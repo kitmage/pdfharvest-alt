@@ -1,0 +1,15 @@
+data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+.streamlit/
+.DS_Store

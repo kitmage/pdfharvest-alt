@@ -1,0 +1,53 @@
+services:
+  pdfharvest:
+    build: .
+    env_file:
+      - .env
+    environment:
+      PDFHARVEST_STORAGE_DIR: /app/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pdfharvest-http.rule=Host(`${DOMAIN:-pdfharvest.yoursw.org}`)"
+      - "traefik.http.routers.pdfharvest-http.entrypoints=web"
+      - "traefik.http.routers.pdfharvest-http.middlewares=redirect-to-https"
+      - "traefik.http.routers.pdfharvest-https.rule=Host(`${DOMAIN:-pdfharvest.yoursw.org}`)"
+      - "traefik.http.routers.pdfharvest-https.entrypoints=websecure"
+      - "traefik.http.routers.pdfharvest-https.tls=true"
+      - "traefik.http.routers.pdfharvest-https.tls.certresolver=letsencrypt"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    networks:
+      - web
+
+  traefik:
+    image: traefik:latest
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Allow long-running uploads (1h read/write) so large PDFs don't get Network Error
+      - "--entrypoints.web.transport.respondingtimeouts.readtimeout=3600"
+      - "--entrypoints.web.transport.respondingtimeouts.writetimeout=3600"
+      - "--entrypoints.websecure.transport.respondingtimeouts.readtimeout=3600"
+      - "--entrypoints.websecure.transport.respondingtimeouts.writetimeout=3600"
+      - "--certificatesresolvers.letsencrypt.acme.email=${CERTBOT_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/etc/traefik/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-pdfharvest.yoursw.org}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/etc/traefik
+    networks:
+      - web
+
+networks:
+  web:
+    name: pdfharvest-web
+
+volumes:
+  traefik-acme:
+    name: pdfharvest-traefik-acme
