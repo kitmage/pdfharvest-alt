@@ -24,6 +24,7 @@ from pdfharvest.pdf_utils import extract_text_from_page, ocr_page
 
 # Regex to strip optional markdown code fences around CSV/TSV
 _CODE_FENCE_RE = re.compile(r"```(?:csv|tsv)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def strip_code_fences(text: str) -> str:
@@ -106,7 +107,9 @@ def _build_prompt() -> ChatPromptTemplate:
                 "Use a consistent column order and field format on every page. "
                 "Extract all data that matches the user request; do not omit fields. "
                 "Do not wrap the output in code fences. "
-                "If something is not present on that page, respond with 'Not found'.",
+                "If something is not present on that page, respond with 'Not found'. "
+                "When vector and OCR differ, choose the field value that is most likely accurate, "
+                "especially for emails, phone numbers, and names.",
             ),
             (
                 "human",
@@ -122,49 +125,65 @@ def _iter_page_text(
     page_offset: int,
     limit_pages: int | None,
     temp_dir: str,
-) -> Iterator[tuple[int, str]]:
-    """
-    Yield (one_based_page_number, page_text) for each page in range.
-    
-    Handles both vector (text-based) and raster (image-based) pages:
-    - Vector pages: Extract native text directly
-    - Raster pages: Use OCR to extract text from rendered images
-    - Mixed pages: Prefer vector text, fall back to OCR if vector is empty
-    """
+) -> Iterator[tuple[int, str, str]]:
+    """Yield one-based page number with both vector and OCR text for each page."""
     total = len(reader.pages)
     start = page_offset
     end = total if limit_pages is None else min(start + limit_pages, total)
     for idx in range(start, end):
         one_based = idx + 1
-        # Try vector text extraction first (fast, accurate for text-based PDFs)
         vector_text = extract_text_from_page(reader, idx)
-        
-        # Always try OCR for raster pages, and also for pages with minimal vector text
-        # (vector extraction might miss content in complex layouts or scanned pages)
         ocr_text = ocr_page(pdf_path, one_based, temp_dir)
-        
-        # Combine both sources: prefer vector if substantial, otherwise use OCR
-        # If both exist, combine them (vector might have structure, OCR might have more content)
-        if vector_text and len(vector_text) > 50:
-            # Vector text is substantial - use it, but append OCR if it adds content
-            if ocr_text and len(ocr_text) > len(vector_text) * 1.5:
-                # OCR found significantly more - use OCR as primary
-                page_text = ocr_text
-            else:
-                page_text = vector_text
-        elif ocr_text:
-            # OCR found content - use it
-            page_text = ocr_text
-        elif vector_text:
-            # Only vector text (even if short) - use it
-            page_text = vector_text
-        else:
-            # Both empty - still yield with empty text so LLM can note the page exists
-            page_text = ""
-        
-        page_text = (page_text or "").strip()
-        # Yield all pages, even if empty (LLM can handle empty pages)
-        yield one_based, page_text
+        yield one_based, (vector_text or "").strip(), (ocr_text or "").strip()
+
+
+def _normalize_email_spacing(text: str) -> str:
+    """Repair common OCR spacing artifacts in email-like tokens."""
+    if not text:
+        return ""
+    normalized = re.sub(r"([A-Za-z0-9._%+-])\s*@\s*([A-Za-z0-9.-])", r"\1@\2", text)
+    normalized = re.sub(r"([A-Za-z0-9.-])\s*\.\s*([A-Za-z]{2,})", r"\1.\2", normalized)
+    return re.sub(r"(?<=@)([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+)", r"\1\2", normalized)
+
+
+def _quality_score(text: str) -> float:
+    """Score extracted text quality with emphasis on clean contact fields."""
+    if not text:
+        return 0.0
+    score = min(len(text), 2000) / 400.0
+    score += len(_EMAIL_RE.findall(text)) * 20
+    score -= len(re.findall(r"\S+@\S+\s+\S+", text)) * 8
+    score -= len(re.findall(r"\.[A-Za-z]{2,}\s+[A-Za-z]{1,4}\b", text)) * 5
+    printable_ratio = sum(ch.isprintable() for ch in text) / max(len(text), 1)
+    return score + printable_ratio * 2
+
+
+def _pick_primary_text(vector_text: str, ocr_text: str) -> str:
+    """Pick higher-quality source text while handling empty inputs."""
+    if vector_text and ocr_text:
+        return ocr_text if _quality_score(ocr_text) > _quality_score(vector_text) else vector_text
+    return ocr_text or vector_text
+
+
+def _build_page_context(one_based: int, vector_text: str, ocr_text: str) -> str:
+    """Build dual-source context for the LLM and include normalization guidance."""
+    if not vector_text and not ocr_text:
+        return (
+            f"[Page {one_based}]\n"
+            "[This page appears to be empty or contains only images/graphics with no extractable text.]"
+        )
+
+    primary_text = _normalize_email_spacing(_pick_primary_text(vector_text, ocr_text))
+    normalized_vector = _normalize_email_spacing(vector_text)
+    normalized_ocr = _normalize_email_spacing(ocr_text)
+    return (
+        f"[Page {one_based}]\n"
+        "Use the primary text as default, and cross-check against vector/OCR sources. "
+        "For emails and URLs, prefer tokens without inserted spaces.\n\n"
+        f"Primary text:\n{primary_text}\n\n"
+        f"Vector extraction:\n{normalized_vector or '[none]'}\n\n"
+        f"OCR extraction:\n{normalized_ocr or '[none]'}"
+    )
 
 
 def run_extraction(
@@ -213,7 +232,7 @@ def run_extraction(
     processed = 0
 
     with tempfile.TemporaryDirectory(dir=str(pdf_path.parent)) as temp_dir:
-        for one_based, page_text in _iter_page_text(
+        for one_based, vector_text, ocr_text in _iter_page_text(
             pdf_path, reader, page_offset, limit_pages, temp_dir
         ):
             processed += 1
@@ -223,11 +242,7 @@ def run_extraction(
                     f"Extracting page {processed}/{effective_total}",
                 )
             include_header = "yes" if header is None else "no"
-            # If page appears empty, give LLM context about it
-            if not page_text:
-                context = f"[Page {one_based}]\n[This page appears to be empty or contains only images/graphics with no extractable text.]"
-            else:
-                context = f"[Page {one_based}]\n{page_text}"
+            context = _build_page_context(one_based, vector_text, ocr_text)
             messages = prompt.format_messages(
                 question=user_prompt,
                 context=context,

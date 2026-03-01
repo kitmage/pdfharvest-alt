@@ -1,6 +1,14 @@
 """Tests for extraction parsing (no LLM)."""
 
-from pdfharvest.extraction import parse_rows, serialize_rows, strip_code_fences
+from pdfharvest.extraction import (
+    _build_page_context,
+    _normalize_email_spacing,
+    _pick_primary_text,
+    _quality_score,
+    parse_rows,
+    serialize_rows,
+    strip_code_fences,
+)
 from pdfharvest.config import OUTPUT_FORMAT_CSV, OUTPUT_FORMAT_TSV
 
 
@@ -54,3 +62,34 @@ def test_parse_rows_page_number_header_lowercase() -> None:
     rows = parse_rows("page_number,foo,bar\n1,alpha,beta", ",")
     assert rows[0][0].strip().lower() == "page_number"
     assert rows == [["page_number", "foo", "bar"], ["1", "alpha", "beta"]]
+
+
+def test_normalize_email_spacing_repairs_common_artifacts() -> None:
+    broken = "rschaab @ Covercoi nsu I ation . com"
+    normalized = _normalize_email_spacing(broken)
+    assert "@" in normalized
+    assert ".com" in normalized
+
+
+def test_quality_score_prefers_valid_email_tokenization() -> None:
+    broken = "Contact: rschaab@Covercoi nsu I ation.com"
+    clean = "Contact: rschaab@covercoinsulation.com"
+    assert _quality_score(clean) > _quality_score(broken)
+
+
+def test_pick_primary_text_chooses_higher_quality_source() -> None:
+    vector_text = "Contact: rschaab@Covercoi nsu I ation.com"
+    ocr_text = "Contact: rschaab@covercoinsulation.com"
+    assert _pick_primary_text(vector_text, ocr_text) == ocr_text
+
+
+def test_build_page_context_contains_dual_sources_and_primary() -> None:
+    context = _build_page_context(
+        3,
+        "Vector: rschaab@Covercoi nsu I ation.com",
+        "OCR: rschaab@covercoinsulation.com",
+    )
+    assert "[Page 3]" in context
+    assert "Primary text:" in context
+    assert "Vector extraction:" in context
+    assert "OCR extraction:" in context
